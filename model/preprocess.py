@@ -1,48 +1,93 @@
-import nibabel as nib
+import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
+from PIL import Image
+from torchvision import transforms
 import random
 
+# CLAHE (Contrast Enhancement)
+def apply_clahe(pil_img):
+    gray = np.array(pil_img.convert("L"))
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    return Image.fromarray(enhanced).convert("RGB")
 
+# Auto Crop Foreground
+def auto_crop(pil_img, threshold=10):
+    gray = np.array(pil_img.convert("L"))
+    coords = np.where(gray > threshold)
 
-def load_mri(path):
-    img = nib.load(path)
-    data = img.get_fdata()
-    return data
+    if coords[0].size == 0:
+        return pil_img
 
-def normalize(img):
-    img = (img - np.mean(img)) / (np.std(img) + 1e-5)
-    return img
+    y1, y2 = coords[0].min(), coords[0].max()
+    x1, x2 = coords[1].min(), coords[1].max()
 
-def resize(img, new_shape=(128, 128, 128)):
-    img = torch.tensor(img).unsqueeze(0).unsqueeze(0)
-    img = F.interpolate(img, size=new_shape, mode="trilinear", align_corners=False)
-    return img.squeeze()
+    return pil_img.crop((x1, y1, x2, y2))
 
-def preprocess(path, augment=False):
-    img = load_mri(path)
-    img = normalize(img)
-    img = resize(img)
-    img = img.float()
+# 2D Skull Stripping (Approx)
+def skull_strip_2d(pil_img):
+    img = np.array(pil_img.convert("L"))
+
+    # Blur
+    img_blur = cv2.GaussianBlur(img, (5, 5), 0)
+
+    # Otsu threshold
+    _, thresh = cv2.threshold(img_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Morphological opening
+    kernel = np.ones((5, 5), np.uint8)
+    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    # Find contours
+    contours, _ = cv2.findContours(opening, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if len(contours) == 0:
+        return pil_img
+
+    # Largest contour = brain region
+    largest_contour = max(contours, key=cv2.contourArea)
+
+    mask = np.zeros_like(img)
+    cv2.drawContours(mask, [largest_contour], -1, 255, thickness=-1)
+
+    stripped = cv2.bitwise_and(img, img, mask=mask)
+
+    return Image.fromarray(stripped).convert("RGB")
+
+# Final Transform Pipeline
+def get_transforms(augment=False):
+    base = [
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                             std=[0.5, 0.5, 0.5])
+    ]
 
     if augment:
-        img = random_flip(img)
-        img = add_noise(img)
+        aug = [
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2)
+        ]
+        return transforms.Compose(aug + base)
+
+    return transforms.Compose(base)
+
+# Main Preprocess Function
+def preprocess_image(img_path, augment=False):
+    img = Image.open(img_path).convert("RGB")
+
+    # Step 1: Auto-crop
+    img = auto_crop(img)
+
+    # Step 2: Skull stripping (approx)
+    img = skull_strip_2d(img)
+
+    # Step 3: CLAHE enhancement
+    img = apply_clahe(img)
+
+    # Step 4: Torch transforms
+    transform = get_transforms(augment)
+    img = transform(img)
 
     return img
-
-
-def random_flip(img):
-    if random.random() > 0.5:
-        img = torch.flip(img, dims=[0])
-    if random.random() > 0.5:
-        img = torch.flip(img, dims=[1])
-    if random.random() > 0.5:
-        img = torch.flip(img, dims=[2])
-    return img
-
-def add_noise(img, noise_level=0.05):
-    noise = torch.randn_like(img) * noise_level
-    return img + noise
-
